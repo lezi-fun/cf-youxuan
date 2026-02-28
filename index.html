@@ -25,7 +25,7 @@
   <body>
     <main class="wrap">
       <h1>☁️ Cloudflare 优选实时测速（Ping + TCPing）</h1>
-      <p class="sub">每 2 秒并行执行一次浏览器环境测速：Ping（HTTP RTT）与 TCPing（HTTPS:443 建连+响应耗时）。</p>
+      <p class="sub">每 2 秒并行请求固定 1KB 探测文件 `probe-1kb.txt`：分别统计 Ping（RTT）与 TCPing（HTTPS:443 建连+响应耗时）。</p>
       <p class="sub" style="margin-top:-8px">参考页面：<a href="https://cf.090227.xyz/" target="_blank" rel="noreferrer">https://cf.090227.xyz/</a></p>
 
       <section class="cards" id="cards"></section>
@@ -40,8 +40,8 @@
 
     <script>
       const endpoints = [
-        { name: "我的优选", domain: "cf.te.lezi.chat" },
-        { name: "对照组", domain: "youxuan.cf.090227.xyz" }
+        { name: "我的优选", domain: "pages.te.lezi.chat" },
+        { name: "对照组", domain: "090227.te.lezi.chat" }
       ];
       const INTERVAL_MS = 2000;
       const TIMEOUT_MS = 4000;
@@ -140,11 +140,11 @@
       }
 
       async function measurePing(domain) {
-        return timedFetch(`https://${domain}/cdn-cgi/trace?ping=${Date.now()}-${Math.random()}`);
+        return timedFetch(`https://${domain}/probe-1kb.txt?ping=${Date.now()}-${Math.random()}`);
       }
 
       async function measureTcping(domain) {
-        return timedFetch(`https://${domain}:443/?tcping=${Date.now()}-${Math.random()}`, { method: "HEAD" });
+        return timedFetch(`https://${domain}:443/probe-1kb.txt?tcping=${Date.now()}-${Math.random()}`, { method: "HEAD" });
       }
 
       function updateMetric(item, latency) {
