@@ -1,213 +1,239 @@
-<!doctype html>
-<html lang="zh-CN">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Cloudflare 优选实时测速（Ping + TCPing）</title>
-    <style>
-      :root { --bg:#f4f7fb; --text:#1f2937; --muted:#6b7280; --primary:#2563eb; --card:#fff; --border:#e5e7eb; --ok:#16a34a; --warn:#d97706; }
-      *{box-sizing:border-box} body{margin:0;font-family:Inter,-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;color:var(--text);background:radial-gradient(circle at 10% -10%, #dbeafe 0, transparent 35%),var(--bg)}
-      .wrap{max-width:980px;margin:0 auto;padding:24px 16px 36px}
-      h1{margin:0;font-size:clamp(1.5rem,4vw,2.1rem)} .sub{color:var(--muted);margin:8px 0 20px}
-      .cards{display:grid;gap:14px} .card{background:var(--card);border:1px solid var(--border);border-radius:14px;padding:16px;box-shadow:0 6px 20px rgba(15,23,42,.05)}
-      .head{display:flex;justify-content:space-between;gap:12px;align-items:center;flex-wrap:wrap}
-      .domain{font-weight:700;word-break:break-all} .tag{color:var(--muted);font-size:.9rem;margin-top:4px}
-      .metrics{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;margin-top:12px}
-      .metric{border:1px solid var(--border);border-radius:10px;padding:10px}
-      .label{font-size:.8rem;color:var(--muted)} .value{font-weight:800;font-size:1.1rem;margin-top:6px}
-      .value.ok{color:var(--ok)} .value.warn{color:var(--warn)} .detail{font-size:.82rem;color:var(--muted);margin-top:6px}
-      .controls{margin-top:16px;display:flex;gap:10px;flex-wrap:wrap} button{border-radius:10px;border:1px solid transparent;padding:10px 14px;font-weight:600;cursor:pointer}
-      .btn-main{background:var(--primary);color:#fff} .btn-ghost{background:#fff;border-color:var(--border);color:var(--text)}
-      .summary{margin-top:16px;background:#fff;border:1px solid var(--border);border-radius:12px;padding:12px 14px;color:var(--muted)} .status-dot{width:8px;height:8px;border-radius:50%;display:inline-block;background:var(--ok);margin-right:8px}
-      .summary strong{color:var(--primary)}
-    </style>
-  </head>
-  <body>
-    <main class="wrap">
-      <h1>☁️ Cloudflare 优选实时测速（Ping + TCPing）</h1>
-      <p class="sub">显示的是优选域名，实际请求的是指定的后端 Pages 地址。每 2 秒并行请求探测文件 `probe-1kb.txt`。</p>
-      
-      <section class="cards" id="cards"></section>
+<script>
+  const endpoints = [
+    { name: "我的优选", domain: "cf.te.lezi.chat", target: "pages.te.lezi.chat" },
+    { name: "对照组", domain: "youxuan.cf.090227.xyz", target: "090227.te.lezi.chat" }
+  ];
 
-      <div class="controls">
-        <button class="btn-main" id="toggle">暂停实时测速</button>
-        <button class="btn-ghost" id="reset">重置统计</button>
-      </div>
+  const INTERVAL_MS = 2000;
+  const TIMEOUT_MS = 4000;
+  const HISTORY_LIMIT = 20;
+  const FAST_THRESHOLD = 350; // ms
+  const TIE_EPSILON = 1; // 1ms 以内视为持平
 
-      <p class="summary" id="summary"><span class="status-dot"></span>初始化中...</p>
-    </main>
+  const cardsEl = document.querySelector("#cards");
+  const summaryEl = document.querySelector("#summary");
+  const toggleBtn = document.querySelector("#toggle");
+  const resetBtn = document.querySelector("#reset");
 
-    <script>
-      // 修改点 1：配置显示的域名 (domain) 和实际请求的域名 (target)
-      const endpoints = [
-        { name: "我的优选", domain: "cf.te.lezi.chat", target: "pages.te.lezi.chat" },
-        { name: "对照组", domain: "youxuan.cf.090227.xyz", target: "090227.te.lezi.chat" }
-      ];
-      const INTERVAL_MS = 2000;   
-      const TIMEOUT_MS = 4000;
-      const HISTORY_LIMIT = 20;
+  function initNode() {
+    return {
+      ping: { history: [], fails: 0, last: undefined },   // undefined=未测试, null=超时
+      tcping: { history: [], fails: 0, last: undefined }
+    };
+  }
 
-      const cardsEl = document.querySelector("#cards");
-      const summaryEl = document.querySelector("#summary");
-      const toggleBtn = document.querySelector("#toggle");
-      const resetBtn = document.querySelector("#reset");
+  const state = new Map(endpoints.map((e) => [e.domain, initNode()]));
 
-      function initNode() {
-        return {
-          ping: { history: [], fails: 0, last: null },
-          tcping: { history: [], fails: 0, last: null }
-        };
+  let running = false;
+  let inFlight = false;
+  let loopTimer = null;
+
+  function avg(values) {
+    return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
+  }
+
+  function renderCards() {
+    cardsEl.innerHTML = endpoints
+      .map(
+        (e) => `
+      <article class="card">
+        <div class="head">
+          <div>
+            <div class="domain">${e.domain}</div>
+            <div class="tag">${e.name} (实际请求: ${e.target})</div>
+          </div>
+        </div>
+        <div class="metrics">
+          <div class="metric">
+            <div class="label">Ping（HTTP RTT）</div>
+            <div class="value" data-value="${e.domain}-ping">待测试</div>
+            <div class="detail" data-detail="${e.domain}-ping">样本 0｜平均 -｜失败 0</div>
+          </div>
+          <div class="metric">
+            <div class="label">TCPing（HTTPS:443）</div>
+            <div class="value" data-value="${e.domain}-tcping">待测试</div>
+            <div class="detail" data-detail="${e.domain}-tcping">样本 0｜平均 -｜失败 0</div>
+          </div>
+        </div>
+      </article>
+    `
+      )
+      .join("");
+  }
+
+  function renderMetric(domain, type) {
+    const item = state.get(domain)?.[type];
+    const valueEl = document.querySelector(`[data-value="${domain}-${type}"]`);
+    const detailEl = document.querySelector(`[data-detail="${domain}-${type}"]`);
+    if (!item || !valueEl || !detailEl) return;
+
+    valueEl.classList.remove("ok", "warn");
+
+    if (item.last === undefined) {
+      valueEl.textContent = "待测试";
+    } else if (item.last === null) {
+      valueEl.textContent = "超时";
+      valueEl.classList.add("warn");
+    } else {
+      valueEl.textContent = `${item.last.toFixed(1)} ms`;
+      valueEl.classList.add(item.last < FAST_THRESHOLD ? "ok" : "warn");
+    }
+
+    const a = avg(item.history);
+    detailEl.textContent = `样本 ${item.history.length}｜平均 ${
+      a === null ? "-" : `${a.toFixed(1)} ms`
+    }｜失败 ${item.fails}`;
+  }
+
+  function renderSummary() {
+    const rows = endpoints.map((e) => ({
+      domain: e.domain,
+      pingAvg: avg(state.get(e.domain).ping.history),
+      tcpAvg: avg(state.get(e.domain).tcping.history)
+    }));
+
+    const pingValid = rows
+      .filter((r) => typeof r.pingAvg === "number")
+      .sort((a, b) => a.pingAvg - b.pingAvg);
+
+    const tcpValid = rows
+      .filter((r) => typeof r.tcpAvg === "number")
+      .sort((a, b) => a.tcpAvg - b.tcpAvg);
+
+    if (pingValid.length < 2 || tcpValid.length < 2) {
+      summaryEl.innerHTML = `<span class="status-dot"></span>${running ? "实时测速中" : "已暂停"}：等待两个域名都出现有效 Ping/TCPing 样本...`;
+      return;
+    }
+
+    const pingLead = pingValid[1].pingAvg - pingValid[0].pingAvg;
+    const tcpLead = tcpValid[1].tcpAvg - tcpValid[0].tcpAvg;
+
+    const pingText =
+      pingLead < TIE_EPSILON
+        ? `Ping 基本持平（差 < ${TIE_EPSILON} ms）`
+        : `Ping 更快 <strong>${pingValid[0].domain}</strong>（约 ${pingLead.toFixed(1)} ms）`;
+
+    const tcpText =
+      tcpLead < TIE_EPSILON
+        ? `TCPing 基本持平（差 < ${TIE_EPSILON} ms）`
+        : `TCPing 更快 <strong>${tcpValid[0].domain}</strong>（约 ${tcpLead.toFixed(1)} ms）`;
+
+    summaryEl.innerHTML = `<span class="status-dot"></span>${running ? "实时测速中" : "已暂停"}：${pingText}，${tcpText}。`;
+  }
+
+  async function timedFetch(url, options = {}) {
+    const start = performance.now();
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), TIMEOUT_MS);
+
+    try {
+      await fetch(url, {
+        mode: "no-cors",
+        cache: "no-store",
+        signal: controller.signal,
+        ...options
+      });
+      return performance.now() - start;
+    } catch {
+      return null;
+    } finally {
+      clearTimeout(t);
+    }
+  }
+
+  async function measurePing(target) {
+    return timedFetch(`https://${target}/probe-1kb.txt?ping=${Date.now()}-${Math.random()}`);
+  }
+
+  async function measureTcping(target) {
+    // 浏览器里无法做真正 TCP SYN ping，这里是 HTTPS 建连+请求耗时近似值
+    return timedFetch(
+      `https://${target}/probe-1kb.txt?tcping=${Date.now()}-${Math.random()}`,
+      { method: "HEAD" }
+    );
+  }
+
+  function updateMetric(item, latency) {
+    item.last = latency;
+    if (latency === null) {
+      item.fails += 1;
+      return;
+    }
+    item.history.push(latency);
+    if (item.history.length > HISTORY_LIMIT) item.history.shift();
+  }
+
+  async function runRound() {
+    if (inFlight) return; // 防止重入
+    inFlight = true;
+
+    try {
+      const result = await Promise.all(
+        endpoints.map(async (e) => {
+          // 同一端点内并行测量
+          const [ping, tcping] = await Promise.all([
+            measurePing(e.target),
+            measureTcping(e.target)
+          ]);
+          return { domain: e.domain, ping, tcping };
+        })
+      );
+
+      for (const row of result) {
+        const node = state.get(row.domain);
+        if (!node) continue;
+        updateMetric(node.ping, row.ping);
+        updateMetric(node.tcping, row.tcping);
+        renderMetric(row.domain, "ping");
+        renderMetric(row.domain, "tcping");
       }
 
-      const state = new Map(endpoints.map((e) => [e.domain, initNode()]));
-      let timer = null;
+      renderSummary();
+    } finally {
+      inFlight = false;
+    }
+  }
 
-      function avg(values) {
-        return values.length ? values.reduce((a, b) => a + b, 0) / values.length : null;
-      }
+  async function loop() {
+    if (!running) return;
+    await runRound();
+    if (running) {
+      loopTimer = setTimeout(loop, INTERVAL_MS); // 上一轮结束后再等待，避免堆积
+    }
+  }
 
-      function renderCards() {
-        cardsEl.innerHTML = endpoints.map((e) => `
-          <article class="card">
-            <div class="head">
-              <div>
-                <div class="domain">${e.domain}</div>
-                <div class="tag">${e.name} (实际请求: ${e.target})</div>
-              </div>
-            </div>
-            <div class="metrics">
-              <div class="metric">
-                <div class="label">Ping（HTTP RTT）</div>
-                <div class="value" data-value="${e.domain}-ping">待测试</div>
-                <div class="detail" data-detail="${e.domain}-ping">样本 0｜平均 -｜失败 0</div>
-              </div>
-              <div class="metric">
-                <div class="label">TCPing（HTTPS:443）</div>
-                <div class="value" data-value="${e.domain}-tcping">待测试</div>
-                <div class="detail" data-detail="${e.domain}-tcping">样本 0｜平均 -｜失败 0</div>
-              </div>
-            </div>
-          </article>
-        `).join("");
-      }
+  function start() {
+    if (running) return;
+    running = true;
+    toggleBtn.textContent = "暂停实时测速";
+    renderSummary();
+    loop();
+  }
 
-      function renderMetric(domain, type) {
-        const item = state.get(domain)?.[type];
-        const valueEl = document.querySelector(`[data-value="${domain}-${type}"]`);
-        const detailEl = document.querySelector(`[data-detail="${domain}-${type}"]`);
-        if (!item || !valueEl || !detailEl) return;
+  function stop() {
+    if (!running) return;
+    running = false;
+    if (loopTimer) {
+      clearTimeout(loopTimer);
+      loopTimer = null;
+    }
+    toggleBtn.textContent = "继续实时测速";
+    renderSummary();
+  }
 
-        valueEl.classList.remove("ok", "warn");
-        valueEl.textContent = item.last === null ? "超时" : `${Math.round(item.last)} ms`;
-        valueEl.classList.add(item.last !== null && item.last < 350 ? "ok" : "warn");
+  function reset() {
+    for (const e of endpoints) {
+      state.set(e.domain, initNode());
+      renderMetric(e.domain, "ping");
+      renderMetric(e.domain, "tcping");
+    }
+    renderSummary();
+  }
 
-        const a = avg(item.history);
-        detailEl.textContent = `样本 ${item.history.length}｜平均 ${a === null ? "-" : `${Math.round(a)} ms`}｜失败 ${item.fails}`;
-      }
+  toggleBtn.addEventListener("click", () => (running ? stop() : start()));
+  resetBtn.addEventListener("click", reset);
 
-      function renderSummary(running) {
-        const rows = endpoints.map((e) => ({
-          domain: e.domain,
-          pingAvg: avg(state.get(e.domain).ping.history),
-          tcpAvg: avg(state.get(e.domain).tcping.history)
-        }));
-
-        const pingValid = rows.filter((r) => typeof r.pingAvg === "number").sort((a, b) => a.pingAvg - b.pingAvg);
-        const tcpValid = rows.filter((r) => typeof r.tcpAvg === "number").sort((a, b) => a.tcpAvg - b.tcpAvg);
-
-        if (pingValid.length < 2 || tcpValid.length < 2) {
-          summaryEl.innerHTML = `<span class="status-dot"></span>${running ? "实时测速中" : "已暂停"}：等待两个域名都出现有效 Ping/TCPing 样本...`;
-          return;
-        }
-
-        const pingDiff = Math.round(pingValid[1].pingAvg - pingValid[0].pingAvg);
-        const tcpDiff = Math.round(tcpValid[1].tcpAvg - tcpValid[0].tcpAvg);
-        summaryEl.innerHTML = `<span class="status-dot"></span>${running ? "实时测速中" : "已暂停"}：Ping 更快 <strong>${pingValid[0].domain}</strong>（约 ${pingDiff} ms），TCPing 更快 <strong>${tcpValid[0].domain}</strong>（约 ${tcpDiff} ms）。`;
-      }
-
-      async function timedFetch(url, options = {}) {
-        const start = performance.now();
-        const controller = new AbortController();
-        const t = setTimeout(() => controller.abort(), TIMEOUT_MS);
-        try {
-          // 这里使用 fetch。如果 cf 端的 Cors 没配置，no-cors 会返回不透明响应，但依然可以测得 RTT
-          await fetch(url, { mode: "no-cors", cache: "no-store", signal: controller.signal, ...options });
-          return performance.now() - start;
-        } catch {
-          return null;
-        } finally {
-          clearTimeout(t);
-        }
-      }
-
-      // 修改点 2：测量函数现在使用 target 参数
-      async function measurePing(target) {
-        return timedFetch(`https://${target}/probe-1kb.txt?ping=${Date.now()}-${Math.random()}`);
-      }
-
-      async function measureTcping(target) {
-        return timedFetch(`https://${target}:443/probe-1kb.txt?tcping=${Date.now()}-${Math.random()}`, { method: "HEAD" });
-      }
-
-      function updateMetric(item, latency) {
-        item.last = latency;
-        if (latency === null) {
-          item.fails += 1;
-          return;
-        }
-        item.history.push(latency);
-        if (item.history.length > HISTORY_LIMIT) item.history.shift();
-      }
-
-      // 修改点 3：在循环中将 target 传给测量函数，但将结果更新到对应的 domain 状态
-      async function runRound() {
-        const result = await Promise.all(endpoints.map(async (e) => ({
-          domain: e.domain,
-          ping: await measurePing(e.target),
-          tcping: await measureTcping(e.target)
-        })));
-
-        for (const row of result) {
-          const node = state.get(row.domain);
-          updateMetric(node.ping, row.ping);
-          updateMetric(node.tcping, row.tcping);
-          renderMetric(row.domain, "ping");
-          renderMetric(row.domain, "tcping");
-        }
-        renderSummary(Boolean(timer));
-      }
-
-      function start() {
-        if (timer) return;
-        runRound();
-        timer = setInterval(runRound, INTERVAL_MS);
-        toggleBtn.textContent = "暂停实时测速";
-        renderSummary(true);
-      }
-
-      function stop() {
-        if (!timer) return;
-        clearInterval(timer);
-        timer = null;
-        toggleBtn.textContent = "继续实时测速";
-        renderSummary(false);
-      }
-
-      function reset() {
-        for (const e of endpoints) {
-          state.set(e.domain, initNode());
-          renderMetric(e.domain, "ping");
-          renderMetric(e.domain, "tcping");
-        }
-        renderSummary(Boolean(timer));
-      }
-
-      toggleBtn.addEventListener("click", () => (timer ? stop() : start()));
-      resetBtn.addEventListener("click", reset);
-
-      renderCards();
-      reset();
-      start();
-    </script>
-  </body>
-</html>
+  renderCards();
+  reset();
+  start();
+</script>
